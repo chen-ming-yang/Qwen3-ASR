@@ -54,6 +54,14 @@ def preload_audios(
         return list(pool.map(load_audio, paths))
 
 
+PUNCTUATION = set('\u3002\uff0c\u3001\uff1b\uff1a\uff1f\uff01\u201c\u201d\u2018\u2019\u3010\u3011\u300a\u300b\uff08\uff09(){}[],.;:?!\'"\n\r\t\u00b7\u2026\u2014\u2500')
+
+
+def strip_punctuation(text: str) -> str:
+    """Remove common Chinese and English punctuation from text."""
+    return "".join(ch for ch in text if ch not in PUNCTUATION)
+
+
 def compute_cer(ref: str, hyp: str) -> tuple:
     """Compute Character Error Rate using edit distance. Returns (errors, ref_len)."""
     r = list(ref.replace(" ", ""))
@@ -192,6 +200,8 @@ def main():
                         help="Sort audio by length to minimize padding waste (default: True)")
     parser.add_argument("--context", type=str, default="",
                         help="Context/prompt string passed as system message to the model")
+    parser.add_argument("--strip_punc", action="store_true", default=True,
+                        help="Strip punctuation from hyp before CER computation (default: True)")
     args = parser.parse_args()
 
     if not args.data_dir and not args.dataset_dir:
@@ -297,7 +307,9 @@ def main():
         cer_iter = tqdm(cer_iter, total=len(results), desc="CER", ncols=80)
     for i, (r, ref) in enumerate(cer_iter):
         hyp = r.text
-        errors, ref_len = compute_cer(ref, hyp)
+        ref_clean = strip_punctuation(ref) if args.strip_punc else ref
+        hyp_clean = strip_punctuation(hyp) if args.strip_punc else hyp
+        errors, ref_len = compute_cer(ref_clean, hyp_clean)
         total_errors += errors
         total_ref_len += ref_len
         cer_i = errors / ref_len * 100 if ref_len > 0 else 0.0
