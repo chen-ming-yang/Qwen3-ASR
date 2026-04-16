@@ -39,12 +39,16 @@ Run with context prompt:
 
 ```bash
 python run/infer.py \
-  --data_dir ./test_data \
+  --dataset_dir /cmy/after_catting/10h \
+  --audio_subdir Audio \
+  --text_subdir Text \
   --model ./Qwen3-ASR-1.7B \
   --device cuda:0 \
   --dtype bfloat16 \
   --batch_size 32 \
-  --context "no no hallucinations, you are a dysarthria speech transcript"
+  --language Chinese \
+  --context "no no hallucinations, you are a dysarthria speech transcript" \
+  --result_file ./outputs/infer_10h_prompt.jsonl
 ```
 
 ## 2) Audio/Text dataset mode (your 10h dataset)
