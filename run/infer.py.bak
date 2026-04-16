@@ -22,12 +22,7 @@ import glob
 import json
 import os
 import re
-import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple
-
-import numpy as np
-import soundfile as sf
 
 try:
     from tqdm import tqdm
@@ -36,22 +31,6 @@ except ImportError:
 
 import torch
 from qwen_asr import Qwen3ASRModel
-
-
-def load_audio(path: str) -> Tuple[np.ndarray, int]:
-    """Load a wav file and return (waveform, sample_rate) tuple."""
-    wav, sr = sf.read(path, dtype="float32")
-    if wav.ndim > 1:
-        wav = wav.mean(axis=1)
-    return wav, sr
-
-
-def preload_audios(
-    paths: List[str], num_workers: int = 8
-) -> List[Tuple[np.ndarray, int]]:
-    """Load audio files in parallel using a thread pool."""
-    with ThreadPoolExecutor(max_workers=num_workers) as pool:
-        return list(pool.map(load_audio, paths))
 
 
 def compute_cer(ref: str, hyp: str) -> tuple:
@@ -182,14 +161,6 @@ def main():
     parser.add_argument("--backend", type=str, default="transformers",
                         choices=["transformers", "vllm"],
                         help="Backend to use for inference (transformers or vllm)")
-    parser.add_argument("--num_workers", type=int, default=8,
-                        help="Threads for parallel audio loading")
-    parser.add_argument("--compile", action="store_true",
-                        help="Use torch.compile() on the model (first batch is slower)")
-    parser.add_argument("--flash_attn", action="store_true",
-                        help="Use Flash Attention 2 (requires flash-attn package)")
-    parser.add_argument("--sort_by_length", action="store_true", default=True,
-                        help="Sort audio by length to minimize padding waste (default: True)")
     args = parser.parse_args()
 
     if not args.data_dir and not args.dataset_dir:
@@ -216,43 +187,15 @@ def main():
     source_desc = args.dataset_dir if args.dataset_dir else args.data_dir
     print(f"Found {len(pairs)} audio/text pairs in {source_desc}")
 
-    # ── Pre-load audio in parallel (biggest I/O speedup) ─────────────
-    audio_paths = [p[0] for p in pairs]
-    ref_texts = [p[1] for p in pairs]
-    utt_ids = [p[2] for p in pairs]
-
-    t0 = time.perf_counter()
-    print(f"Pre-loading {len(audio_paths)} audio files ({args.num_workers} threads)...")
-    audio_data = preload_audios(audio_paths, num_workers=args.num_workers)
-    print(f"Audio loaded in {time.perf_counter() - t0:.1f}s")
-
-    # ── Sort by audio length for efficient padding ───────────────────
-    if args.sort_by_length:
-        order = sorted(range(len(audio_data)), key=lambda i: len(audio_data[i][0]))
-        audio_data = [audio_data[i] for i in order]
-        ref_texts = [ref_texts[i] for i in order]
-        utt_ids = [utt_ids[i] for i in order]
-        audio_paths = [audio_paths[i] for i in order]
-
-    # ── Load model ───────────────────────────────────────────────────
-    torch.backends.cudnn.benchmark = True
-
+    # Load model with backend
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
-    extra_kwargs = {}
-    if args.flash_attn:
-        extra_kwargs["attn_implementation"] = "flash_attention_2"
-
     if args.backend == "transformers":
         model = Qwen3ASRModel.from_pretrained(
             args.model,
             dtype=dtype_map[args.dtype],
             device_map=args.device,
             max_inference_batch_size=args.batch_size,
-            **extra_kwargs,
         )
-        if args.compile:
-            print("Compiling model with torch.compile()...")
-            model.model = torch.compile(model.model, mode="reduce-overhead")
     elif args.backend == "vllm":
         model = Qwen3ASRModel.LLM(
             model=args.model,
@@ -261,29 +204,28 @@ def main():
     else:
         raise ValueError(f"Unsupported backend: {args.backend}")
 
-    # ── Inference (pass pre-loaded numpy arrays, not file paths) ─────
-    batch_size = args.batch_size if args.batch_size > 0 else 32
-    results = [None] * len(audio_data)
+    # Inference
+    audio_paths = [p[0] for p in pairs]
+    ref_texts = [p[1] for p in pairs]
+    utt_ids = [p[2] for p in pairs]
 
-    t0 = time.perf_counter()
-    with torch.inference_mode():
-        iterator = range(0, len(audio_data), batch_size)
-        if tqdm is not None:
-            print(f"Running inference on {len(audio_data)} samples...")
-            iterator = tqdm(iterator, desc="Infer", ncols=80)
-        else:
-            print("[warn] tqdm not installed, progress bar disabled.")
-
-        for i in iterator:
-            batch_audio = audio_data[i : i + batch_size]
+    if tqdm is not None:
+        print(f"Running inference on {len(audio_paths)} samples...")
+        results = []
+        batch_size = args.batch_size if args.batch_size > 0 else 32
+        for i in tqdm(range(0, len(audio_paths), batch_size), desc="Infer", ncols=80):
+            batch_audios = audio_paths[i:i+batch_size]
             batch_results = model.transcribe(
-                audio=batch_audio,
+                audio=batch_audios,
                 language=(args.language if args.language else None),
             )
-            for j, r in enumerate(batch_results):
-                results[i + j] = r
-
-    print(f"Inference done in {time.perf_counter() - t0:.1f}s")
+            results.extend(batch_results)
+    else:
+        print("[warn] tqdm not installed, progress bar disabled. Run 'pip install tqdm' for progress bar.")
+        results = model.transcribe(
+            audio=audio_paths,
+            language=(args.language if args.language else None),
+        )
 
     # Compute CER
     total_errors = 0

@@ -49,6 +49,51 @@ Language prefix recommendation:
 Note:
 - If you set `language None`, the model will not learn language detection from that prefix.
 
+### 2.1) Streaming mode (low RAM / small /dev/shm)
+
+For large datasets or limited shared memory, enable streaming so samples are not fully loaded into memory.
+
+Key points:
+- Use `--streaming 1` to enable iterable datasets.
+- Set `--max_steps` to a positive value (required for streaming).
+- `--eval_ratio` is not supported in streaming mode; use `--eval_file` instead.
+- Consider `--num_workers 0` to avoid `/dev/shm` pressure.
+
+Example (JSONL):
+```bash
+python qwen3_asr_sft.py \
+  --model_path Qwen/Qwen3-ASR-1.7B \
+  --train_file ./train.jsonl \
+  --eval_file ./eval.jsonl \
+  --output_dir ./qwen3-asr-finetuning-out \
+  --batch_size 32 \
+  --grad_acc 4 \
+  --lr 2e-5 \
+  --epochs 1 \
+  --save_steps 200 \
+  --streaming 1 \
+  --max_steps 2000 \
+  --num_workers 0
+```
+
+Example (Audio/Text directory):
+```bash
+python qwen3_asr_sft.py \
+  --model_path Qwen/Qwen3-ASR-1.7B \
+  --dataset_dir /path/to/dataset \
+  --audio_subdir Audio \
+  --text_subdir Text \
+  --output_dir ./qwen3-asr-finetuning-out \
+  --batch_size 32 \
+  --grad_acc 4 \
+  --lr 2e-5 \
+  --epochs 1 \
+  --save_steps 200 \
+  --streaming 1 \
+  --max_steps 2000 \
+  --num_workers 0
+```
+
 ### 3) Fine-tune (single GPU)
 
 ```bash

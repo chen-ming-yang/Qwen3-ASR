@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 import librosa
 import torch
-from datasets import load_dataset
+from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict, load_dataset
 from qwen_asr import Qwen3ASRModel
 from transformers import (GenerationConfig, Trainer, TrainerCallback,
                           TrainingArguments)
@@ -109,6 +109,142 @@ def make_preprocess_fn_prefix_only(processor):
         }
 
     return _preprocess
+
+
+def build_dataset_from_audio_text_dir(
+    dataset_dir: str,
+    audio_subdir: str,
+    text_subdir: str,
+    default_prompt: str,
+    strict_audio: bool,
+) -> List[Dict[str, str]]:
+    audio_root = os.path.join(dataset_dir, audio_subdir)
+    text_root = os.path.join(dataset_dir, text_subdir)
+
+    if not os.path.isdir(audio_root):
+        raise ValueError(f"Audio directory not found: {audio_root}")
+    if not os.path.isdir(text_root):
+        raise ValueError(f"Text directory not found: {text_root}")
+
+    txt_files = sorted(
+        [
+            os.path.join(text_root, fn)
+            for fn in os.listdir(text_root)
+            if fn.lower().endswith(".txt") and os.path.isfile(os.path.join(text_root, fn))
+        ]
+    )
+    if not txt_files:
+        raise ValueError(f"No .txt files found under: {text_root}")
+
+    records: List[Dict[str, str]] = []
+    missing_audio = 0
+    malformed_lines = 0
+
+    for txt_file in txt_files:
+        # Shard comes from the leading number in filenames like 01_label.txt / 20-label.txt.
+        base_name = os.path.basename(txt_file)
+        shard_match = re.match(r"^(\d+)", base_name)
+        if shard_match is None:
+            raise ValueError(
+                f"Cannot infer shard from text file name: {base_name}. "
+                "Expected a leading numeric prefix like 01_label.txt"
+            )
+        shard = shard_match.group(1)
+
+        with open(txt_file, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                parts = line.split(maxsplit=1)
+                if len(parts) < 2:
+                    malformed_lines += 1
+                    continue
+
+                utt_id, text = parts[0], parts[1]
+                audio_path = os.path.join(audio_root, shard, f"{utt_id}.wav")
+
+                if not os.path.exists(audio_path):
+                    missing_audio += 1
+                    if strict_audio:
+                        raise ValueError(f"Missing audio for utt_id={utt_id}: {audio_path}")
+                    continue
+
+                records.append(
+                    {
+                        "audio": audio_path,
+                        "text": text,
+                        "prompt": default_prompt,
+                    }
+                )
+
+    if not records:
+        raise ValueError("No valid samples were built from dataset_dir")
+
+    print(
+        "[dataset] built from directory: "
+        f"samples={len(records)}, missing_audio={missing_audio}, malformed_lines={malformed_lines}"
+    )
+    return records
+
+
+def iter_records_from_audio_text_dir(
+    dataset_dir: str,
+    audio_subdir: str,
+    text_subdir: str,
+    default_prompt: str,
+    strict_audio: bool,
+):
+    audio_root = os.path.join(dataset_dir, audio_subdir)
+    text_root = os.path.join(dataset_dir, text_subdir)
+
+    if not os.path.isdir(audio_root):
+        raise ValueError(f"Audio directory not found: {audio_root}")
+    if not os.path.isdir(text_root):
+        raise ValueError(f"Text directory not found: {text_root}")
+
+    txt_files = sorted(
+        [
+            os.path.join(text_root, fn)
+            for fn in os.listdir(text_root)
+            if fn.lower().endswith(".txt") and os.path.isfile(os.path.join(text_root, fn))
+        ]
+    )
+    if not txt_files:
+        raise ValueError(f"No .txt files found under: {text_root}")
+
+    for txt_file in txt_files:
+        base_name = os.path.basename(txt_file)
+        shard_match = re.match(r"^(\d+)", base_name)
+        if shard_match is None:
+            raise ValueError(
+                f"Cannot infer shard from text file name: {base_name}. "
+                "Expected a leading numeric prefix like 01_label.txt"
+            )
+        shard = shard_match.group(1)
+
+        with open(txt_file, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                parts = line.split(maxsplit=1)
+                if len(parts) < 2:
+                    continue
+
+                utt_id, text = parts[0], parts[1]
+                audio_path = os.path.join(audio_root, shard, f"{utt_id}.wav")
+
+                if not os.path.exists(audio_path):
+                    if strict_audio:
+                        raise ValueError(f"Missing audio for utt_id={utt_id}: {audio_path}")
+                    continue
+
+                yield {
+                    "audio": audio_path,
+                    "text": text,
+                    "prompt": default_prompt,
+                }
 
 
 @dataclass
@@ -207,6 +343,13 @@ def parse_args():
     p.add_argument("--model_path", type=str, default="Qwen/Qwen3-ASR-1.7B")
     p.add_argument("--train_file", type=str, default="train.jsonl")
     p.add_argument("--eval_file", type=str, default="")
+    p.add_argument("--dataset_dir", type=str, default="")
+    p.add_argument("--audio_subdir", type=str, default="Audio")
+    p.add_argument("--text_subdir", type=str, default="Text")
+    p.add_argument("--prompt", type=str, default="")
+    p.add_argument("--eval_ratio", type=float, default=0.0)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--strict_audio", type=int, default=0)
     p.add_argument("--output_dir", type=str, default="./qwen3-asr-finetuning-out")
 
     # Audio
@@ -220,6 +363,13 @@ def parse_args():
     p.add_argument("--log_steps", type=int, default=10)
     p.add_argument("--lr_scheduler_type", type=str, default="linear")
     p.add_argument("--warmup_ratio", type=float, default=0.02)
+    p.add_argument("--max_steps", type=int, default=-1)
+    p.add_argument(
+        "--streaming",
+        type=int,
+        default=0,
+        help="Use streaming/iterable datasets to reduce memory usage",
+    )
 
     # DataLoader
     p.add_argument("--num_workers", type=int, default=4)
@@ -242,8 +392,17 @@ def parse_args():
 def main():
     args_cli = parse_args()
 
-    if not args_cli.train_file:
+    if not args_cli.dataset_dir and not args_cli.train_file:
         raise ValueError("TRAIN_FILE is required (json/jsonl). Needs fields: audio, text, optional prompt")
+
+    if args_cli.eval_ratio < 0 or args_cli.eval_ratio >= 1:
+        raise ValueError("--eval_ratio must be in [0, 1)")
+
+    use_streaming = args_cli.streaming == 1
+    if use_streaming and args_cli.eval_ratio > 0:
+        raise ValueError("--eval_ratio is not supported with --streaming 1; use --eval_file")
+    if use_streaming and args_cli.max_steps <= 0:
+        raise ValueError("--max_steps must be > 0 when --streaming 1 is enabled")
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
     asr_wrapper = Qwen3ASRModel.from_pretrained(
@@ -257,18 +416,73 @@ def main():
     patch_outer_forward(model)
     model.generation_config = GenerationConfig.from_model_config(model.config)
 
-    raw_ds = load_dataset(
-        "json",
-        data_files={
-            "train": args_cli.train_file,
-            **({"validation": args_cli.eval_file} if args_cli.eval_file else {}),
-        },
-    )
-    ds = raw_ds.map(make_preprocess_fn_prefix_only(processor), num_proc=1)
+    if args_cli.dataset_dir:
+        if use_streaming:
+            train_ds = IterableDataset.from_generator(
+                iter_records_from_audio_text_dir,
+                gen_kwargs={
+                    "dataset_dir": args_cli.dataset_dir,
+                    "audio_subdir": args_cli.audio_subdir,
+                    "text_subdir": args_cli.text_subdir,
+                    "default_prompt": args_cli.prompt,
+                    "strict_audio": (args_cli.strict_audio == 1),
+                },
+            )
+            if args_cli.eval_file:
+                eval_raw = load_dataset(
+                    "json",
+                    data_files={"validation": args_cli.eval_file},
+                    streaming=True,
+                )
+                raw_ds = IterableDatasetDict(
+                    {"train": train_ds, "validation": eval_raw["validation"]}
+                )
+            else:
+                raw_ds = IterableDatasetDict({"train": train_ds})
+        else:
+            records = build_dataset_from_audio_text_dir(
+                dataset_dir=args_cli.dataset_dir,
+                audio_subdir=args_cli.audio_subdir,
+                text_subdir=args_cli.text_subdir,
+                default_prompt=args_cli.prompt,
+                strict_audio=(args_cli.strict_audio == 1),
+            )
+
+            train_ds = Dataset.from_list(records)
+            if args_cli.eval_file:
+                eval_raw = load_dataset("json", data_files={"validation": args_cli.eval_file})
+                raw_ds = DatasetDict(
+                    {"train": train_ds, "validation": eval_raw["validation"]}
+                )
+            elif args_cli.eval_ratio > 0:
+                split = train_ds.train_test_split(
+                    test_size=args_cli.eval_ratio, seed=args_cli.seed
+                )
+                raw_ds = DatasetDict({"train": split["train"], "validation": split["test"]})
+            else:
+                raw_ds = DatasetDict({"train": train_ds})
+    else:
+        raw_ds = load_dataset(
+            "json",
+            data_files={
+                "train": args_cli.train_file,
+                **({"validation": args_cli.eval_file} if args_cli.eval_file else {}),
+            },
+            streaming=use_streaming,
+        )
+
+    preprocess_fn = make_preprocess_fn_prefix_only(processor)
+    if use_streaming:
+        ds = raw_ds.map(preprocess_fn)
+    else:
+        ds = raw_ds.map(preprocess_fn, num_proc=1)
 
     keep = {"prompt", "audio", "target", "prefix_text"}
     for split in ds.keys():
-        drop = [c for c in ds[split].column_names if c not in keep]
+        cols = getattr(ds[split], "column_names", None)
+        if not cols:
+            continue
+        drop = [c for c in cols if c not in keep]
         if drop:
             ds[split] = ds[split].remove_columns(drop)
 
@@ -280,20 +494,21 @@ def main():
         gradient_accumulation_steps=args_cli.grad_acc,
         learning_rate=args_cli.lr,
         num_train_epochs=args_cli.epochs,
+        max_steps=args_cli.max_steps,
         logging_steps=args_cli.log_steps,
         lr_scheduler_type=args_cli.lr_scheduler_type,
         warmup_ratio=args_cli.warmup_ratio,
         dataloader_num_workers=args_cli.num_workers,
         dataloader_pin_memory=(args_cli.pin_memory == 1),
-        dataloader_persistent_workers=(args_cli.persistent_workers == 1),
+        dataloader_persistent_workers=(args_cli.persistent_workers == 1 and args_cli.num_workers > 0),
         dataloader_prefetch_factor=args_cli.prefetch_factor if args_cli.num_workers > 0 else None,
         save_strategy=args_cli.save_strategy,
         save_steps=args_cli.save_steps,
         save_total_limit=args_cli.save_total_limit,
         save_safetensors=True,
-        eval_strategy="steps",
+        eval_strategy="steps" if ("validation" in ds) else "no",
         eval_steps=args_cli.save_steps,
-        do_eval=bool(args_cli.eval_file),
+        do_eval=("validation" in ds),
         bf16=use_bf16,
         fp16=not use_bf16,
         ddp_find_unused_parameters=False,
