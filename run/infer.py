@@ -190,6 +190,8 @@ def main():
                         help="Use Flash Attention 2 (requires flash-attn package)")
     parser.add_argument("--sort_by_length", action="store_true", default=True,
                         help="Sort audio by length to minimize padding waste (default: True)")
+    parser.add_argument("--context", type=str, default="",
+                        help="Context/prompt string passed as system message to the model")
     args = parser.parse_args()
 
     if not args.data_dir and not args.dataset_dir:
@@ -278,6 +280,7 @@ def main():
             batch_audio = audio_data[i : i + batch_size]
             batch_results = model.transcribe(
                 audio=batch_audio,
+                context=args.context,
                 language=(args.language if args.language else None),
             )
             for j, r in enumerate(batch_results):
@@ -325,6 +328,15 @@ def main():
             for item in per_utt:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
         print(f"Saved per-utterance results to: {args.result_file}")
+
+        summary_file = os.path.splitext(args.result_file)[0] + "_summary.txt"
+        with open(summary_file, "w", encoding="utf-8") as f:
+            f.write(f"===== Results =====\n")
+            f.write(f"Total utterances: {len(pairs)}\n")
+            f.write(f"Overall CER:      {overall_cer:.2f}%\n")
+            f.write(f"Total errors:     {total_errors}\n")
+            f.write(f"Total ref chars:  {total_ref_len}\n")
+        print(f"Saved summary to: {summary_file}")
 
 
 if __name__ == "__main__":

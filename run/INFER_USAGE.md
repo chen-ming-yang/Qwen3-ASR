@@ -35,6 +35,18 @@ python run/infer.py \
   --batch_size 32
 ```
 
+Run with context prompt:
+
+```bash
+python run/infer.py \
+  --data_dir ./test_data \
+  --model ./Qwen3-ASR-1.7B \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --batch_size 32 \
+  --context "no no hallucinations, you are a dysarthria speech transcript"
+```
+
 ## 2) Audio/Text dataset mode (your 10h dataset)
 
 Directory format:
@@ -91,6 +103,7 @@ python run/infer.py \
 
 ## 3) Important options
 
+- `--context TEXT`: context/prompt string passed as system message to the model (e.g. `--context "no hallucinations, you are a dysarthria speech transcript"`).
 - `--language Chinese`: force language. Use empty string for auto-detect.
 - `--max_samples N`: run only first N samples (0 means all).
 - `--strict_audio 1`: fail if transcript exists but matching wav is missing.
