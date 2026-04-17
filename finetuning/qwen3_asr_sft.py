@@ -251,6 +251,7 @@ def iter_records_from_audio_text_dir(
 class DataCollatorForQwen3ASRFinetuning:
     processor: Any
     sampling_rate: int = 16000
+    max_audio_seconds: float = 0.0
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         audio_paths = [f["audio"] for f in features]
@@ -260,6 +261,10 @@ class DataCollatorForQwen3ASRFinetuning:
         eos = self.processor.tokenizer.eos_token or ""
         full_texts = [pfx + tgt + eos for pfx, tgt in zip(prefix_texts, targets)]
         audios = [load_audio(p, sr=self.sampling_rate) for p in audio_paths]
+        if self.max_audio_seconds > 0:
+            max_samples = int(self.max_audio_seconds * self.sampling_rate)
+            if max_samples > 0:
+                audios = [a[:max_samples] for a in audios]
 
         full_inputs = self.processor(
             text=full_texts,
@@ -364,6 +369,13 @@ def parse_args():
     p.add_argument("--lr_scheduler_type", type=str, default="linear")
     p.add_argument("--warmup_ratio", type=float, default=0.02)
     p.add_argument("--max_steps", type=int, default=-1)
+    p.add_argument("--gradient_checkpointing", type=int, default=1)
+    p.add_argument(
+        "--max_audio_seconds",
+        type=float,
+        default=0.0,
+        help="Truncate each training audio to at most this duration (0 disables)",
+    )
     p.add_argument(
         "--streaming",
         type=int,
@@ -415,6 +427,13 @@ def main():
 
     patch_outer_forward(model)
     model.generation_config = GenerationConfig.from_model_config(model.config)
+
+    use_gradient_checkpointing = args_cli.gradient_checkpointing == 1
+    if use_gradient_checkpointing:
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+            model.config.use_cache = False
 
     if args_cli.dataset_dir:
         if use_streaming:
@@ -486,7 +505,14 @@ def main():
         if drop:
             ds[split] = ds[split].remove_columns(drop)
 
-    collator = DataCollatorForQwen3ASRFinetuning(processor=processor, sampling_rate=args_cli.sr)
+    if args_cli.max_audio_seconds > 0:
+        print(f"[train] max_audio_seconds={args_cli.max_audio_seconds} (audio will be truncated)")
+
+    collator = DataCollatorForQwen3ASRFinetuning(
+        processor=processor,
+        sampling_rate=args_cli.sr,
+        max_audio_seconds=args_cli.max_audio_seconds,
+    )
 
     training_args = TrainingArguments(
         output_dir=args_cli.output_dir,
@@ -498,6 +524,7 @@ def main():
         logging_steps=args_cli.log_steps,
         lr_scheduler_type=args_cli.lr_scheduler_type,
         warmup_ratio=args_cli.warmup_ratio,
+        gradient_checkpointing=use_gradient_checkpointing,
         dataloader_num_workers=args_cli.num_workers,
         dataloader_pin_memory=(args_cli.pin_memory == 1),
         dataloader_persistent_workers=(args_cli.persistent_workers == 1 and args_cli.num_workers > 0),
@@ -522,7 +549,7 @@ def main():
         train_dataset=ds["train"],
         eval_dataset=ds.get("validation", None),
         data_collator=collator,
-        tokenizer=processor.tokenizer,
+        processing_class=processor,
         callbacks=[MakeEveryCheckpointInferableCallback(base_model_path=args_cli.model_path)],
     )
 
