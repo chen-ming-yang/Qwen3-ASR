@@ -197,4 +197,9 @@ torchrun --nproc_per_node=2 qwen3_asr_sft.py \
   --pin_memory 1 \
   --persistent_workers 1 \
   --prefetch_factor 2
+
+python qwen3_asr_sft.py --model_path Qwen3-ASR-1.7B --dataset_dir /cmy/after_catting/10h --audio_subdir Audio --text_subdir Text --prompt "" --output_dir ./qwen3-asr-finetuning-out --batch_size 8 --grad_acc 16 --lr 2e-5 --epochs 2 --save_steps 200 --streaming 1 --max_steps 2000 --num_workers 0 --pin_memory 0 --persistent_workers 0 --gradient_checkpointing 1 --max_audio_seconds 30
+
+
+
 ```
