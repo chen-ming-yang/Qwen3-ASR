@@ -94,8 +94,25 @@ def build_prefix_messages(prompt: str, audio_array):
 
 
 def make_preprocess_fn_prefix_only(processor):
+    def _pick_first(ex: Dict[str, Any], candidates: List[str]) -> Optional[Any]:
+        for k in candidates:
+            if k in ex and ex[k] is not None:
+                return ex[k]
+        return None
+
     def _preprocess(ex: Dict[str, Any]) -> Dict[str, Any]:
-        prompt = ex.get("prompt", "")
+        prompt = _pick_first(ex, ["prompt", "instruction", "system_prompt"]) or ""
+        audio = _pick_first(ex, ["audio", "source", "audio_path", "wav", "path"])
+        text = _pick_first(ex, ["text", "target", "transcript", "label"])
+
+        if audio is None or text is None:
+            raise ValueError(
+                "Dataset row is missing audio/text fields. "
+                "Supported audio keys: audio/source/audio_path/wav/path; "
+                "text keys: text/target/transcript/label. "
+                f"Got keys: {sorted(list(ex.keys()))}"
+            )
+
         dummy_audio = None
         prefix_msgs = build_prefix_messages(prompt, dummy_audio)
         prefix_text = processor.apply_chat_template(
@@ -103,12 +120,74 @@ def make_preprocess_fn_prefix_only(processor):
         )[0]
         return {
             "prompt": prompt,
-            "audio": ex["audio"],
-            "target": ex["text"],
+            "audio": str(audio),
+            "target": str(text),
             "prefix_text": prefix_text,
         }
 
     return _preprocess
+
+
+def find_first_existing_json(data_dir: str, candidates: List[str]) -> Optional[str]:
+    seen = set()
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+
+        if os.path.isabs(cand):
+            if os.path.isfile(cand):
+                return cand
+            continue
+
+        path = os.path.join(data_dir, cand)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def build_json_data_files_from_dir(
+    data_dir: str,
+    train_file: str,
+    eval_file: str,
+) -> Dict[str, str]:
+    if not os.path.isdir(data_dir):
+        raise ValueError(f"data_dir not found: {data_dir}")
+
+    train_path = find_first_existing_json(
+        data_dir,
+        [train_file, "train.jsonl", "train.json"],
+    )
+    if not train_path:
+        raise ValueError(
+            f"No train file found in data_dir={data_dir}. "
+            "Expected train.jsonl (or pass --train_file)."
+        )
+
+    eval_candidates = [eval_file] if eval_file else [
+        "val.jsonl",
+        "validation.jsonl",
+        "eval.jsonl",
+        "dev.jsonl",
+        "val.json",
+        "validation.json",
+    ]
+    eval_path = find_first_existing_json(data_dir, eval_candidates)
+    test_path = find_first_existing_json(data_dir, ["test.jsonl", "test.json"])
+
+    data_files = {"train": train_path}
+    if eval_path:
+        data_files["validation"] = eval_path
+    if test_path:
+        data_files["test"] = test_path
+
+    print(
+        "[dataset] json splits: "
+        f"train={data_files.get('train')} "
+        f"validation={data_files.get('validation', 'N/A')} "
+        f"test={data_files.get('test', 'N/A')}"
+    )
+    return data_files
 
 
 def build_dataset_from_audio_text_dir(
@@ -348,6 +427,12 @@ def parse_args():
     p.add_argument("--model_path", type=str, default="Qwen/Qwen3-ASR-1.7B")
     p.add_argument("--train_file", type=str, default="train.jsonl")
     p.add_argument("--eval_file", type=str, default="")
+    p.add_argument(
+        "--data_dir",
+        type=str,
+        default="",
+        help="Directory containing json/jsonl splits like train/val/test",
+    )
     p.add_argument("--dataset_dir", type=str, default="")
     p.add_argument("--audio_subdir", type=str, default="Audio")
     p.add_argument("--text_subdir", type=str, default="Text")
@@ -404,8 +489,11 @@ def parse_args():
 def main():
     args_cli = parse_args()
 
-    if not args_cli.dataset_dir and not args_cli.train_file:
-        raise ValueError("TRAIN_FILE is required (json/jsonl). Needs fields: audio, text, optional prompt")
+    if not args_cli.data_dir and not args_cli.dataset_dir and not args_cli.train_file:
+        raise ValueError(
+            "Need one data source: --data_dir, --dataset_dir, or --train_file. "
+            "JSON rows require fields: audio, text, optional prompt"
+        )
 
     if args_cli.eval_ratio < 0 or args_cli.eval_ratio >= 1:
         raise ValueError("--eval_ratio must be in [0, 1)")
@@ -434,8 +522,20 @@ def main():
             model.gradient_checkpointing_enable()
         if hasattr(model, "config") and hasattr(model.config, "use_cache"):
             model.config.use_cache = False
+        if hasattr(model, "generation_config") and hasattr(model.generation_config, "use_cache"):
+            model.generation_config.use_cache = False
+        thinker = getattr(model, "thinker", None)
+        if thinker is not None and hasattr(thinker, "config") and hasattr(thinker.config, "use_cache"):
+            thinker.config.use_cache = False
 
-    if args_cli.dataset_dir:
+    if args_cli.data_dir:
+        data_files = build_json_data_files_from_dir(
+            data_dir=args_cli.data_dir,
+            train_file=args_cli.train_file,
+            eval_file=args_cli.eval_file,
+        )
+        raw_ds = load_dataset("json", data_files=data_files, streaming=use_streaming)
+    elif args_cli.dataset_dir:
         if use_streaming:
             train_ds = IterableDataset.from_generator(
                 iter_records_from_audio_text_dir,

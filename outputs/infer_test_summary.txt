@@ -1,0 +1,5 @@
+===== Results =====
+Total utterances: 4644
+Overall CER:      40.29%
+Total errors:     11469
+Total ref chars:  28469

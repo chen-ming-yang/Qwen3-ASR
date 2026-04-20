@@ -49,6 +49,42 @@ Language prefix recommendation:
 Note:
 - If you set `language None`, the model will not learn language detection from that prefix.
 
+### 2.2) JSON split directory mode
+
+If you already have a directory like this:
+
+```text
+data/
+  train.jsonl
+  val.jsonl
+  test.jsonl
+```
+
+You can pass only `--data_dir`, and the script will auto-detect:
+- train: `train.jsonl` (or `train.json`)
+- validation: first existing among `val.jsonl`, `validation.jsonl`, `eval.jsonl`, `dev.jsonl`
+- test: optional `test.jsonl` (loaded but not used by Trainer)
+- Use `--max_audio_seconds` to cap each sample duration during training and reduce CUDA OOM risk.
+
+Example:
+
+```bash
+python finetuning/qwen3_asr_sft.py \
+  --model_path ./Qwen3-ASR-1.7B \
+  --data_dir ./data \
+  --output_dir ./qwen3-asr-finetuning-out \
+  --batch_size 8 \
+  --grad_acc 16 \
+  --lr 2e-5 \
+  --epochs 2 \
+  --save_steps 200 \
+  --num_workers 0 \
+  --pin_memory 0 \
+  --persistent_workers 0 \
+  --gradient_checkpointing 1 \
+  --max_audio_seconds 30
+```
+
 ### 2.1) Streaming mode (low RAM / small /dev/shm)
 
 For large datasets or limited shared memory, enable streaming so samples are not fully loaded into memory.
@@ -58,6 +94,7 @@ Key points:
 - Set `--max_steps` to a positive value (required for streaming).
 - `--eval_ratio` is not supported in streaming mode; use `--eval_file` instead.
 - Consider `--num_workers 0` to avoid `/dev/shm` pressure.
+- Use `--max_audio_seconds` (for example `20` or `30`) to limit per-sample length and lower peak GPU memory.
 
 Example (JSONL):
 ```bash
