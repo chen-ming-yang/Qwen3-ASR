@@ -140,6 +140,10 @@ def find_first_existing_json(data_dir: str, candidates: List[str]) -> Optional[s
                 return cand
             continue
 
+        # Try the path as-is first (handles relative paths like "foo/bar.jsonl")
+        if os.path.isfile(cand):
+            return cand
+
         path = os.path.join(data_dir, cand)
         if os.path.isfile(path):
             return path
@@ -164,6 +168,7 @@ def build_json_data_files_from_dir(
             "Expected train.jsonl (or pass --train_file)."
         )
 
+    # eval_file may be an absolute path, a file that already exists, or a name inside data_dir
     eval_candidates = [eval_file] if eval_file else [
         "val.jsonl",
         "validation.jsonl",
@@ -511,6 +516,19 @@ def main():
         device_map=None,
     )
     model = asr_wrapper.model
+
+    # thinker_config has tie_word_embeddings=true, so lm_head.weight shares the same
+    # underlying tensor as embed_tokens.weight and is NOT stored separately in the
+    # safetensors file. HuggingFace re-ties them automatically at load time.
+    # Log the state to confirm.
+    lm_head_ws = model.state_dict().get("thinker.lm_head.weight", None)
+    embed_ws = model.state_dict().get("thinker.model.embed_tokens.weight", None)
+    if lm_head_ws is not None and embed_ws is not None and lm_head_ws is embed_ws:
+        print("[lm_head] lm_head.weight is tied to embed_tokens.weight (as expected)")
+    elif lm_head_ws is not None:
+        print("[lm_head] WARNING: lm_head.weight is NOT tied to embed_tokens.weight — "
+              "this may indicate a loading issue")
+
     processor = asr_wrapper.processor
 
     patch_outer_forward(model)
