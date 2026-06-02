@@ -1,0 +1,20 @@
+{
+  "model": "/cmy/cmy/Qwen3-ASR/qwen3-asr-finetuning-out-bak/checkpoint-326",
+  "device": "cuda:0",
+  "dtype": "bfloat16",
+  "num_samples_profiled": 50,
+  "model_size_disk_mb": 11662.5,
+  "cpu_memory": {
+    "rss_before_load_mb": 1003.3,
+    "rss_after_load_mb": 1311.7,
+    "rss_peak_during_infer_mb": 2038.7,
+    "model_load_delta_mb": 308.5
+  },
+  "gpu_memory": {
+    "after_load_allocated_mb": 3893.2,
+    "after_load_reserved_mb": 3908.0,
+    "peak_allocated_mb": 3977.6,
+    "peak_reserved_mb": 4022.0,
+    "inference_peak_delta_mb": 84.5
+  }
+}

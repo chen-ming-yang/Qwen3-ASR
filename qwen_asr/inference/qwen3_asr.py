@@ -203,9 +203,17 @@ class Qwen3ASRModel:
             Qwen3ASRModel
         """
 
+        import os
+        if isinstance(pretrained_model_name_or_path, str) and os.path.isdir(pretrained_model_name_or_path):
+            kwargs.setdefault("local_files_only", True)
+
         model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
 
-        processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, fix_mistral_regex=True)
+        processor = AutoProcessor.from_pretrained(
+            pretrained_model_name_or_path,
+            fix_mistral_regex=True,
+            local_files_only=kwargs.get("local_files_only", False),
+        )
 
         forced_aligner_model = None
         if forced_aligner is not None:

@@ -1,0 +1,423 @@
+# coding=utf-8
+# GSPO (Grouped Supervised Policy Optimization) for Qwen3-ASR.
+# Implements the official GSPO algorithm for ASR reinforcement learning.
+#
+# Flow per sample:
+#   (1) Beam search (G=4) -> candidate transcripts
+#   (2) Reward = 1 - CER/WER (ASR accuracy)
+#   (3) Group-relative advantage: A_i = (r_i - mean(r)) / std(r)
+#   (4) Importance weight: s_i = exp((log pi_theta - log pi_old) / |y_i|)
+#   (5) Clip s_i to [eps_low=0.7, eps_high=1.3] (sequence-level)
+#   (6) Loss = -mean[A_i * clip(s_i)]
+
+import argparse
+import json
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+import jiwer
+import logging
+import librosa
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from datetime import datetime
+from transformers import GenerationConfig, get_scheduler
+from transformers import AutoConfig, AutoModel, AutoProcessor
+
+from qwen_asr import Qwen3ASRModel
+from qwen_asr.core.transformers_backend import (
+    Qwen3ASRConfig,
+    Qwen3ASRForConditionalGeneration,
+    Qwen3ASRProcessor,
+)
+from qwen_asr.inference.utils import SAMPLE_RATE
+
+
+AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
+AutoModel.register(Qwen3ASRConfig, Qwen3ASRForConditionalGeneration)
+AutoProcessor.register(Qwen3ASRConfig, Qwen3ASRProcessor)
+
+GSPO_GROUP_SIZE = 4
+GSPO_EPS_LOW = 0.7
+GSPO_EPS_HIGH = 1.3
+
+
+class ASRJsonlDataset(Dataset):
+    """JSONL dataset: {source, target} per line."""
+
+    def __init__(self, jsonl_path: str):
+        self.samples: List[Dict[str, str]] = []
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                self.samples.append(obj)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+
+def load_audio(path: str, sr: int = 16000) -> np.ndarray:
+    wav, _ = librosa.load(path, sr=sr, mono=True)
+    return wav
+
+
+_ZH_PAT = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]")
+
+
+def _is_zh(text: str) -> bool:
+    if not text:
+        return True
+    return len(_ZH_PAT.findall(text)) / max(len(text), 1) > 0.5
+
+
+def compute_cer(hyp: str, ref: str) -> float:
+    return jiwer.cer(ref, hyp)
+
+
+def compute_wer(hyp: str, ref: str) -> float:
+    return jiwer.wer(ref, hyp)
+
+
+def compute_asr_reward(hyp: str, ref: str) -> float:
+    if _is_zh(ref) and _is_zh(hyp):
+        return 1.0 - compute_cer(hyp, ref)
+    else:
+        return 1.0 - compute_wer(hyp, ref)
+
+
+def patch_outer_forward(model):
+    """Route model.forward() through model.thinker.forward()."""
+    cls = model.__class__
+    if getattr(cls, "_forward_patched", False):
+        return
+    if not hasattr(model, "thinker") or not hasattr(model.thinker, "forward"):
+        raise RuntimeError("No .thinker.forward on model")
+
+    def forward(self, input_ids=None, attention_mask=None,
+                input_features=None, feature_attention_mask=None,
+                labels=None, **kwargs):
+        return self.thinker.forward(
+            input_ids=input_ids, attention_mask=attention_mask,
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
+            labels=labels, **kwargs)
+
+    cls.forward = forward
+    cls._forward_patched = True
+
+
+def _build_messages(context: str, audio) -> List[Dict]:
+    return [
+        {"role": "system", "content": context or ""},
+        {"role": "user", "content": [{"type": "audio", "audio": audio}]},
+    ]
+
+
+def _build_text_prompt(processor, context: str, lang: Optional[str]) -> str:
+    msgs = _build_messages(context=context, audio="")
+    base = processor.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+    if lang:
+        base = base + "language " + lang + "<asr_text>"
+    return base
+
+
+@torch.no_grad()
+def beam_generate(model, processor, audio_array, context="",
+                  num_groups=GSPO_GROUP_SIZE, max_new_tokens=256):
+    """Beam search -> G candidate transcripts + log probs (old policy)."""
+    text_prompt = _build_text_prompt(processor, context=context, lang=None)
+    inputs = processor(text=[text_prompt], audio=[audio_array],
+                      return_tensors="pt", padding=True)
+    inputs = {k: v.to(model.device) for k, v in inputs.items() if hasattr(v, "to")}
+    prompt_len = inputs["input_ids"].shape[1]
+
+    gen = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                         num_beams=num_groups, num_return_sequences=num_groups,
+                         output_scores=True, 
+                         early_stopping=False)
+
+    seqs = gen.sequences[:, prompt_len:]
+    scores = gen.scores
+    G = seqs.shape[0]
+    log_p = torch.zeros(G, device=model.device)
+    for g in range(G):
+        for t, tok in enumerate(seqs[g]):
+            if t < len(scores):
+                lp = F.log_softmax(scores[t][g, :], dim=-1)
+                log_p[g] += lp[tok]
+
+    texts = processor.batch_decode(seqs, skip_special_tokens=True)
+    texts = [t.strip() for t in texts]
+    return texts, seqs, log_p
+
+
+def compute_sequence_log_probs(model, processor, audio_array, sequences, context=""):
+    """Compute log pi_theta(y_i|x) for G sequences via forward pass."""
+    G, gen_len = sequences.shape
+    text_prompt = _build_text_prompt(processor, context=context, lang=None)
+
+    # Get processor output with real audio (includes audio encoder tokens)
+    inputs = processor(text=[text_prompt]*G, audio=[audio_array]*G,
+                      return_tensors="pt", padding=True)
+    prompt_len = inputs["input_ids"].shape[1]
+    full_len = prompt_len + gen_len
+    pad_id = processor.tokenizer.pad_token_id
+    device = sequences.device
+
+    # Build full input_ids = prompt + generated tokens
+    all_ids = torch.full((G, full_len), pad_id, dtype=torch.long, device=device)
+    for g in range(G):
+        nz = (sequences[g] != pad_id).sum().item()
+        all_ids[g, :prompt_len] = inputs["input_ids"][g, :prompt_len]
+        all_ids[g, prompt_len:prompt_len + nz] = sequences[g][:nz]
+
+    # Override input_ids and provide proper attention_mask for full sequence
+    inputs["input_ids"] = all_ids
+    inputs["attention_mask"] = (all_ids != pad_id).long()
+    inputs["labels"] = all_ids.clone()
+    inputs["labels"][:, :prompt_len] = -100
+    inputs = {k: v.to(model.device) for k, v in inputs.items() if hasattr(v, "to")}
+
+    out = model(**inputs)
+
+    logits = out.logits[:, :-1, :].contiguous()
+    labels = inputs["labels"][:, 1:].contiguous()
+    mask = (labels != -100)
+    safe_labels = labels.clamp(min=0)
+    lp = F.log_softmax(logits, dim=-1)
+    tok_lp = lp.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
+    tok_lp[~mask] = 0.0
+    return tok_lp.sum(dim=1)
+def gspo_loss(advantages, log_p_theta, log_p_old, seq_lens,
+              eps_low=GSPO_EPS_LOW, eps_high=GSPO_EPS_HIGH):
+    """GSPO loss: -mean[A_i * clip(exp((log_p_theta - log_p_old)/|y_i|))]"""
+    ratio = torch.exp((log_p_theta - log_p_old) / seq_lens)
+    clipped = torch.clamp(ratio, eps_low, eps_high)
+    return -torch.mean(advantages * clipped)
+
+
+def setup_logger(log_file: str) -> logging.Logger:
+    """Configure logger writing to both file and console."""
+    logger = logging.getLogger("gspo")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    logger.handlers.clear()
+
+    fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-5s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    logger.addHandler(fh)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(ch)
+    return logger
+
+
+def parse_args():
+    p = argparse.ArgumentParser("Qwen3-ASR GSPO")
+    p.add_argument("--model_path", type=str, default="Qwen/Qwen3-ASR-1.7B")
+    p.add_argument("--train_file", type=str, required=True)
+    p.add_argument("--output_dir", type=str, default="./qwen3-asr-gspo-out")
+    p.add_argument("--group_size", type=int, default=GSPO_GROUP_SIZE)
+    p.add_argument("--eps_low", type=float, default=GSPO_EPS_LOW)
+    p.add_argument("--eps_high", type=float, default=GSPO_EPS_HIGH)
+    p.add_argument("--lr", type=float, default=1e-6)
+    p.add_argument("--max_new_tokens", type=int, default=256)
+    p.add_argument("--num_epochs", type=int, default=1)
+    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    p.add_argument("--max_grad_norm", type=float, default=1.0)
+    p.add_argument("--lr_scheduler", type=str, default="cosine")
+    p.add_argument("--warmup_steps", type=int, default=10)
+    p.add_argument("--save_steps", type=int, default=50)
+    p.add_argument("--log_file", type=str, default="",
+                    help="Path to log file (default: {output_dir}/training.log)")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    log_file = args.log_file or os.path.join(args.output_dir, "training.log")
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    logger = setup_logger(log_file)
+
+    logger.info("=" * 60)
+    logger.info("Qwen3-ASR GSPO Reinforcement Learning")
+    logger.info("=" * 60)
+    logger.info(f"Train file:     {args.train_file}")
+    logger.info(f"Output dir:     {args.output_dir}")
+    logger.info(f"Log file:       {log_file}")
+    logger.info(f"Group size:     {args.group_size}")
+    logger.info(f"Learning rate:  {args.lr}")
+    logger.info(f"Epochs:         {args.num_epochs}")
+    logger.info(f"Batch size:     {args.batch_size}")
+    logger.info(f"Grad accum:     {args.gradient_accumulation_steps}")
+    logger.info(f"Eps low/high:   {args.eps_low} / {args.eps_high}")
+    logger.info(f"Max new tokens: {args.max_new_tokens}")
+    logger.info("=" * 60)
+
+    logger.info(f"Loading data: {args.train_file}")
+    ds = ASRJsonlDataset(args.train_file)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+                       num_workers=0, collate_fn=lambda b: b)
+    logger.info(f"Loaded {len(ds)} samples")
+
+    logger.info(f"Loading model: {args.model_path}")
+    use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
+    dtype = torch.bfloat16 if use_bf16 else torch.float16
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Device: {device}  dtype: {dtype}")
+
+    wrapper = Qwen3ASRModel.from_pretrained(args.model_path, dtype=dtype, device_map=None)
+    model = wrapper.model
+    proc = wrapper.processor
+    patch_outer_forward(model)
+    model.generation_config = GenerationConfig.from_model_config(model.config)
+    model.to(device)
+    # Ensure audio tower weights match processor default (float32 inputs)
+    # audio_tower lives at model.thinker.audio_tower (contains Conv2d layers)
+    if hasattr(model, "thinker") and hasattr(model.thinker, "audio_tower"):
+        model.thinker.audio_tower = model.thinker.audio_tower.to(dtype=torch.float32)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    spp = max(len(ds) // args.batch_size // args.gradient_accumulation_steps, 1)
+    total_steps = spp * args.num_epochs
+    sched = get_scheduler(args.lr_scheduler, opt, num_warmup_steps=args.warmup_steps,
+                         num_training_steps=total_steps)
+
+    global_step = 0
+    opt.zero_grad()
+
+    for epoch in range(args.num_epochs):
+        bar = tqdm(loader, desc=f"Epoch {epoch+1}")
+        for bidx, batch in enumerate(bar):
+            for sample in batch:
+                audio_path = sample.get("source") or sample.get("audio")
+                ref_text = sample.get("target") or sample.get("text")
+                prompt = sample.get("prompt", "")
+
+                if not os.path.exists(audio_path):
+                    continue
+
+                audio = load_audio(audio_path, sr=SAMPLE_RATE)
+
+                # A) Beam generate G candidates (reference policy)
+                model.eval()
+                cands, seq_ids, log_p_old = beam_generate(
+                    model, proc, audio, prompt,
+                    num_groups=args.group_size, max_new_tokens=args.max_new_tokens)
+                model.train()
+
+                # Per-sample CER/WER for logging
+                indiv_cers = []
+                for t in cands:
+                    if t.strip():
+                        if _is_zh(t) and _is_zh(ref_text):
+                            indiv_cers.append(compute_cer(t, ref_text))
+                        else:
+                            indiv_cers.append(compute_wer(t, ref_text))
+                    else:
+                        indiv_cers.append(1.0)
+
+                # B) Rewards + group-relative advantage
+                rewards = [compute_asr_reward(t, ref_text) if t.strip() else 0.0
+                           for t in cands]
+                valid = list(range(len(rewards)))
+                if len(valid) < 2:
+                    continue
+
+                r_t = torch.tensor([rewards[i] for i in valid], dtype=torch.float32, device=device)
+                adv = (r_t - r_t.mean()) / r_t.std().clamp(min=1e-8)
+
+                log_p_old_v = log_p_old[valid]
+                seq_ids_v = seq_ids[valid]
+                seq_lens = (seq_ids_v != proc.tokenizer.pad_token_id).sum(dim=1).float()
+
+                # C) pi_theta log probs (current model, gradient tracking)
+                log_p_theta = compute_sequence_log_probs(model, proc, audio, seq_ids_v, prompt)
+
+                # D) GSPO loss
+                loss = gspo_loss(adv, log_p_theta, log_p_old_v.detach(), seq_lens,
+                                args.eps_low, args.eps_high)
+                (loss / args.gradient_accumulation_steps).backward()
+
+                best_r = max(rewards)
+                best_i = int(np.argmax(rewards))
+
+                # Per-sample debug log
+                fname = os.path.basename(audio_path)
+                logger.debug(
+                    "sample | %s | ref=\"%s\" | best=\"%s\" | CER_best=%.3f | reward=%.3f | n_valid=%d",
+                    fname, ref_text[:40], cands[best_i][:40], indiv_cers[best_i], best_r, len(valid)
+                )
+
+            # E) Optimizer step with gradient accumulation
+            if (bidx + 1) % args.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                opt.step()
+                sched.step()
+                opt.zero_grad()
+                global_step += 1
+
+                loss_item = loss.item() * args.gradient_accumulation_steps
+                grad_norm = sum(p.grad.norm(2).item()**2 for p in model.parameters() if p.grad is not None)**0.5
+                current_lr = sched.get_last_lr()[0]
+                rewards_arr = np.array(rewards)
+                adv_arr = adv.detach().cpu().numpy()
+
+                bar.set_postfix({
+                    "loss": f"{loss_item:.4f}",
+                    "reward": f"{best_r:.3f}",
+                    "mean_cer": f"{np.mean(indiv_cers):.3f}",
+                })
+
+                logger.info(
+                    "step=%-4d | loss=%.4f | reward_mean=%.4f reward_best=%.4f | "
+                    "adv_mean=%.4f adv_std=%.4f | CER_mean=%.3f CER_best=%.3f | "
+                    "grad_norm=%.4f | lr=%.2e",
+                    global_step, loss_item,
+                    rewards_arr.mean(), best_r,
+                    adv_arr.mean(), adv_arr.std(),
+                    np.mean(indiv_cers), np.min(indiv_cers),
+                    grad_norm, current_lr
+                )
+
+                if global_step % args.save_steps == 0:
+                    ckpt = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    os.makedirs(ckpt, exist_ok=True)
+                    model.save_pretrained(ckpt)
+                    proc.save_pretrained(ckpt)
+                    logger.info(f"Checkpoint saved: {ckpt}")
+
+    final = os.path.join(args.output_dir, "final")
+    os.makedirs(final, exist_ok=True)
+    model.save_pretrained(final)
+    proc.save_pretrained(final)
+    logger.info("=" * 60)
+    logger.info(f"Training complete. Final model: {final}")
+    logger.info(f"Total steps: {global_step}")
+    logger.info("=" * 60)
+
+    # Flush handlers
+    for h in logger.handlers:
+        h.flush()
+
+
+if __name__ == "__main__":
+    main()

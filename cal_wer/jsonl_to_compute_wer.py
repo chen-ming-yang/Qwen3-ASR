@@ -3,7 +3,6 @@
 
 Input JSONL line example:
 {"utt_id": "xxx", "ref": "...", "hyp": "...", ...}
-
 Output file format for compute-wer:
 utt_id text
 """
@@ -15,6 +14,8 @@ import json
 import subprocess
 import unicodedata
 from pathlib import Path
+
+import jiwer
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,6 +38,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--hyp-out",
         default="hyp_from_jsonl.txt",
         help="Output hypothesis filename under out-dir (default: hyp_from_jsonl.txt)",
+    )
+    parser.add_argument(
+        "--cer-out",
+        default=None,
+        help="Output file for per-utterance CER results (default: not written)",
     )
     parser.add_argument(
         "--min-ref-chars",
@@ -144,6 +150,29 @@ def main() -> None:
     )
     print(f"ref file: {ref_out}")
     print(f"hyp file: {hyp_out}")
+
+    # Per-utterance CER via jiwer
+    cerr = []
+    with args.input_jsonl.open("r", encoding="utf-8") as fin:
+        for raw_line in fin:
+            line = raw_line.strip()
+            if not line:
+                continue
+            item = json.loads(line)
+            ref = normalize_text(item.get(args.ref_key))
+            hyp = normalize_text(item.get(args.hyp_key))
+            if args.strip_hyp_punctuation:
+                hyp = remove_punctuation(hyp)
+            utt = normalize_text(item.get(args.utt_key))
+            if not utt:
+                continue
+            cer_val = jiwer.cer(ref, hyp) * 100
+            cerr.append(f"{utt} CER: {cer_val:.2f}%")
+    cer_text = "\n".join(cerr)
+    if args.cer_out:
+        cer_path = args.out_dir / args.cer_out
+        cer_path.write_text(cer_text, encoding="utf-8")
+        print(f"cer file: {cer_path}")
 
     if args.run_compute_wer:
         cmd = [args.compute_wer_bin, str(ref_out), str(hyp_out)]

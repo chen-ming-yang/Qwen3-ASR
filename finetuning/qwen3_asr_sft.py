@@ -21,6 +21,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import librosa
+import numpy as np
+import subprocess
+import tempfile
 import torch
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict, load_dataset
 from qwen_asr import Qwen3ASRModel
@@ -84,6 +87,47 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
 def load_audio(path: str, sr: int = 16000):
     wav, _ = librosa.load(path, sr=sr, mono=True)
     return wav
+
+
+def augment_audio_sox(audio_array: np.ndarray, sr: int,
+                       tempo_factor: float = 1.0,
+                       speed_factor: float = 1.0) -> np.ndarray:
+    """Apply tempo and speed perturbation via sox (subprocess).
+
+    Tempo changes speed without changing pitch.
+    Speed changes both tempo and pitch simultaneously.
+    """
+    if abs(tempo_factor - 1.0) < 1e-6 and abs(speed_factor - 1.0) < 1e-6:
+        return audio_array
+
+    import scipy.io.wavfile as wavfile
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile(suffix=".wav", delete=False) as f_in:
+        in_path = f_in.name
+    with _tf.NamedTemporaryFile(suffix=".wav", delete=False) as f_out:
+        out_path = f_out.name
+
+    try:
+        wavfile.write(in_path, sr, audio_array)
+        effects = []
+        if abs(tempo_factor - 1.0) > 1e-6:
+            effects.extend(["tempo", f"{tempo_factor:.6f}"])
+        if abs(speed_factor - 1.0) > 1e-6:
+            effects.extend(["speed", f"{speed_factor:.6f}"])
+        subprocess.run(["sox", in_path, out_path] + effects,
+                       capture_output=True, timeout=30, check=True)
+        augmented, _ = librosa.load(out_path, sr=sr, mono=True)
+        return augmented
+    except Exception as exc:
+        import warnings
+        warnings.warn(f"sox augmentation failed: {exc}. Using original audio.")
+        return audio_array
+    finally:
+        for p in (in_path, out_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 def build_prefix_messages(prompt: str, audio_array):
@@ -336,6 +380,25 @@ class DataCollatorForQwen3ASRFinetuning:
     processor: Any
     sampling_rate: int = 16000
     max_audio_seconds: float = 0.0
+    tempo_range: float = 0.0
+    speed_range: float = 0.0
+    augment_prob: float = 0.5
+
+    def __post_init__(self):
+        self._rng = np.random.RandomState(42)
+
+    def _maybe_augment(self, audio: np.ndarray) -> np.ndarray:
+        if self.tempo_range <= 0 and self.speed_range <= 0:
+            return audio
+        if self._rng.random() >= self.augment_prob:
+            return audio
+        tf = 1.0
+        if self.tempo_range > 0:
+            tf = 1.0 + self._rng.uniform(-self.tempo_range, self.tempo_range)
+        sf = 1.0
+        if self.speed_range > 0:
+            sf = 1.0 + self._rng.uniform(-self.speed_range, self.speed_range)
+        return augment_audio_sox(audio, self.sampling_rate, tf, sf)
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         audio_paths = [f["audio"] for f in features]
@@ -345,10 +408,19 @@ class DataCollatorForQwen3ASRFinetuning:
         eos = self.processor.tokenizer.eos_token or ""
         full_texts = [pfx + tgt + eos for pfx, tgt in zip(prefix_texts, targets)]
         audios = [load_audio(p, sr=self.sampling_rate) for p in audio_paths]
+        # Apply augmentation
+        audios = [self._maybe_augment(a) for a in audios]
         if self.max_audio_seconds > 0:
             max_samples = int(self.max_audio_seconds * self.sampling_rate)
             if max_samples > 0:
-                audios = [a[:max_samples] for a in audios]
+                keep = [i for i, a in enumerate(audios) if len(a) <= max_samples]
+                dropped = len(audios) - len(keep)
+                if dropped > 0:
+                    print(f"  [collator] dropped {dropped}/{len(audios)} samples exceeding max_audio_seconds={self.max_audio_seconds}s")
+                audios = [audios[i] for i in keep]
+                full_texts = [full_texts[i] for i in keep]
+                prefix_texts = [prefix_texts[i] for i in keep]
+                print(f"  [collator] max_audio_seconds={self.max_audio_seconds}s, kept {len(audios)}/{len(features)} samples")
 
         full_inputs = self.processor(
             text=full_texts,
@@ -465,6 +537,25 @@ def parse_args():
         type=float,
         default=0.0,
         help="Truncate each training audio to at most this duration (0 disables)",
+    )
+    # Audio augmentation
+    p.add_argument(
+        "--tempo_range",
+        type=float,
+        default=0.0,
+        help="Tempo perturbation range (e.g. 0.1 means uniform [0.9, 1.1]). 0 disables. Requires sox.",
+    )
+    p.add_argument(
+        "--speed_range",
+        type=float,
+        default=0.0,
+        help="Speed perturbation range (e.g. 0.1 means uniform [0.9, 1.1]). 0 disables. Requires sox.",
+    )
+    p.add_argument(
+        "--augment_prob",
+        type=float,
+        default=0.5,
+        help="Probability of applying augmentation to each sample (default 0.5).",
     )
     p.add_argument(
         "--streaming",
@@ -599,14 +690,25 @@ def main():
             else:
                 raw_ds = DatasetDict({"train": train_ds})
     else:
+        # Load train and validation separately so differing schemas don't collide.
+        # Force fresh download to avoid stale cached schemas from previous runs.
         raw_ds = load_dataset(
             "json",
-            data_files={
-                "train": args_cli.train_file,
-                **({"validation": args_cli.eval_file} if args_cli.eval_file else {}),
-            },
+            data_files={"train": args_cli.train_file},
             streaming=use_streaming,
+            download_mode="force_redownload",
         )
+        if args_cli.eval_file:
+            eval_ds = load_dataset(
+                "json",
+                data_files={"validation": args_cli.eval_file},
+                streaming=use_streaming,
+                download_mode="force_redownload",
+            )
+            raw_ds = DatasetDict({
+                "train": raw_ds["train"],
+                "validation": eval_ds["validation"],
+            })
 
     preprocess_fn = make_preprocess_fn_prefix_only(processor)
     if use_streaming:
@@ -624,12 +726,15 @@ def main():
             ds[split] = ds[split].remove_columns(drop)
 
     if args_cli.max_audio_seconds > 0:
-        print(f"[train] max_audio_seconds={args_cli.max_audio_seconds} (audio will be truncated)")
+        print(f"[train] max_audio_seconds={args_cli.max_audio_seconds} (audio exceeding limit will be skipped)")
 
     collator = DataCollatorForQwen3ASRFinetuning(
         processor=processor,
         sampling_rate=args_cli.sr,
         max_audio_seconds=args_cli.max_audio_seconds,
+        tempo_range=args_cli.tempo_range,
+        speed_range=args_cli.speed_range,
+        augment_prob=args_cli.augment_prob,
     )
 
     training_args = TrainingArguments(

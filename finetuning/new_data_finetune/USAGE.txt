@@ -1,0 +1,75 @@
+voxflame-oss-by-account Dataset Converter
+========================================
+
+Convert the voxflame-oss-by-account dataset (extracted from voxflame-oss-by-account.zip)
+into Qwen3-ASR finetuning JSONL format.
+
+Output format (one JSON line per sample):
+    {"audio": "/abs/path/to/file.wav", "text": "transcript"}
+
+Quality filters applied:
+    - alignment_status == "matched"   (forced aligner confirmed audio-transcript match)
+    - transcript.confidence >= 0.3    (configurable via --min-confidence)
+    - duration / text_length <= 4.0   (configurable via --max-dur-ratio; skips repeated-speech recordings)
+
+Usage
+-----
+Convert all accounts:
+
+    python finetuning/new_data_finetune/convert_voxflame.py \
+        --src voxflame-oss-by-account/oss-by-account \
+        --out finetuning/new_data_finetune/voxflame_train.jsonl
+
+Custom confidence threshold:
+
+    python finetuning/new_data_finetune/convert_voxflame.py \
+        --src voxflame-oss-by-account/oss-by-account \
+        --out finetuning/new_data_finetune/voxflame_train.jsonl \
+        --min-confidence 0.5
+
+Strict duration-to-text ratio (e.g. 2-char label "老师" spoken for 24s would be filtered):
+
+    python finetuning/new_data_finetune/convert_voxflame.py \
+        --src voxflame-oss-by-account/oss-by-account \
+        --out finetuning/new_data_finetune/voxflame_train.jsonl \
+        --max-dur-ratio 4.0
+
+Finetuning (new training from base model):
+    DATA_DIR=./finetuning/new_data_finetune bash finetuning/run_finetune_data_dir.sh
+
+Finetuning continuation (resume from checkpoint, e.g. checkpoint-326):
+
+python finetuning/qwen3_asr_sft.py \
+  --model_path ./qwen3-asr-finetuning-out/checkpoint-326 \
+  --data_dir finetuning/new_data_finetune \
+  --train_file voxflame_train.jsonl \
+  --eval_file val.jsonl \
+  --output_dir ./qwen3-asr-finetuning-out \
+  --resume_from ./qwen3-asr-finetuning-out/checkpoint-326 \
+  --max_steps 600 \
+  --batch_size 8 \
+  --grad_acc 2 \
+  --lr 1e-5 \
+  --save_steps 20 \
+  --num_workers 0 \
+  --persistent_workers 0
+
+
+    Key arguments for continuation:
+        --model_path   Path to the checkpoint to load as new base (e.g. ./qwen3-asr-finetuning-out/checkpoint-326)
+        --resume 1     Auto-finds the latest checkpoint under --output_dir and resumes from its trainer state
+        --lr           Use a lower learning rate (e.g. 1e-5) than the initial run (2e-5) to avoid catastrophic forgetting
+
+Output
+------
+    finetuning/new_data_finetune/voxflame_train.jsonl   <- training samples
+
+Dataset breakdown (with defaults --min-confidence 0.3 --max-dur-ratio 4.0):
+    1137205964__8a533bbe  : 100 / 112 passed
+    13818790456__d01b4410 :   1 /  27 passed
+    2307294809__64758dee   : 272 / 284 passed
+    874888410__800f7d03   :   1 /   3 passed
+    ltf.edgar__53649c22   :   0 /   4 passed   (removed: repeated-speech / label mismatch)
+    legacy__v_gv7fxwrp    :   0 /   5 passed
+    -----------------------------------------------
+    Total                  : 374 samples

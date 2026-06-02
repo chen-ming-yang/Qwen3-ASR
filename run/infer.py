@@ -22,6 +22,7 @@ import glob
 import json
 import os
 import re
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple
@@ -60,26 +61,6 @@ PUNCTUATION = set('\u3002\uff0c\u3001\uff1b\uff1a\uff1f\uff01\u201c\u201d\u2018\
 def strip_punctuation(text: str) -> str:
     """Remove common Chinese and English punctuation from text."""
     return "".join(ch for ch in text if ch not in PUNCTUATION)
-
-
-def compute_cer(ref: str, hyp: str) -> tuple:
-    """Compute Character Error Rate using edit distance. Returns (errors, ref_len)."""
-    r = list(ref.replace(" ", ""))
-    h = list(hyp.replace(" ", ""))
-    n = len(r)
-    m = len(h)
-    if n == 0:
-        return m, 0
-    d = [[0] * (m + 1) for _ in range(n + 1)]
-    for i in range(n + 1):
-        d[i][0] = i
-    for j in range(m + 1):
-        d[0][j] = j
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            cost = 0 if r[i - 1] == h[j - 1] else 1
-            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
-    return d[n][m], n
 
 
 def collect_pairs_from_flat_dir(data_dir: str) -> List[Tuple[str, str, str]]:
@@ -164,12 +145,70 @@ def collect_pairs_from_audio_text_dir(
     return pairs
 
 
+def collect_pairs_from_jsonl(input_jsonl: str) -> List[Tuple[str, str, str]]:
+    if not os.path.isfile(input_jsonl):
+        raise ValueError(f"JSONL file not found: {input_jsonl}")
+
+    pairs: List[Tuple[str, str, str]] = []
+    malformed_lines = 0
+    missing_audio = 0
+
+    with open(input_jsonl, "r", encoding="utf-8") as f:
+        for line_num, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON on line {line_num} of {input_jsonl}: {exc}") from exc
+
+            audio_path = (
+                item.get("source")
+                or item.get("audio")
+                or item.get("audio_path")
+                or item.get("wav")
+                or item.get("path")
+            )
+            ref_text = (
+                item.get("target")
+                or item.get("text")
+                or item.get("transcript")
+                or item.get("label")
+            )
+
+            if not audio_path or ref_text is None:
+                malformed_lines += 1
+                continue
+
+            if not os.path.exists(audio_path):
+                missing_audio += 1
+                continue
+
+            utt_id = (
+                item.get("key")
+                or item.get("utt_id")
+                or item.get("id")
+                or os.path.splitext(os.path.basename(audio_path))[0]
+            )
+            pairs.append((str(audio_path), str(ref_text), str(utt_id)))
+
+    print(
+        "[dataset] loaded from jsonl: "
+        f"pairs={len(pairs)}, missing_audio={missing_audio}, malformed_lines={malformed_lines}"
+    )
+    return pairs
+
+
 def main():
     parser = argparse.ArgumentParser(description="Qwen3-ASR inference + CER evaluation")
     parser.add_argument("--data_dir", type=str, default="",
                         help="Directory containing flat .wav/.txt file pairs")
     parser.add_argument("--dataset_dir", type=str, default="",
                         help="Dataset root containing Audio/ and Text/ subdirectories")
+    parser.add_argument("--input_jsonl", type=str, default="",
+                        help="JSONL file containing source/audio path and target text")
     parser.add_argument("--audio_subdir", type=str, default="Audio")
     parser.add_argument("--text_subdir", type=str, default="Text")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-ASR-1.7B",
@@ -202,13 +241,18 @@ def main():
                         help="Context/prompt string passed as system message to the model")
     parser.add_argument("--strip_punc", action="store_true", default=True,
                         help="Strip punctuation from hyp before CER computation (default: True)")
+    parser.add_argument("--skip_cal_wer", action="store_true",
+                        help="Skip the external cal_wer.sh WER computation step")
     args = parser.parse_args()
 
-    if not args.data_dir and not args.dataset_dir:
-        raise ValueError("One of --data_dir or --dataset_dir is required")
+    input_modes = [bool(args.data_dir), bool(args.dataset_dir), bool(args.input_jsonl)]
+    if sum(input_modes) != 1:
+        raise ValueError("Use exactly one of --data_dir, --dataset_dir, or --input_jsonl")
 
     # Collect wav/txt pairs
-    if args.dataset_dir:
+    if args.input_jsonl:
+        pairs = collect_pairs_from_jsonl(args.input_jsonl)
+    elif args.dataset_dir:
         pairs = collect_pairs_from_audio_text_dir(
             dataset_dir=args.dataset_dir,
             audio_subdir=args.audio_subdir,
@@ -225,7 +269,7 @@ def main():
     if args.max_samples > 0:
         pairs = pairs[:args.max_samples]
 
-    source_desc = args.dataset_dir if args.dataset_dir else args.data_dir
+    source_desc = args.input_jsonl or args.dataset_dir or args.data_dir
     print(f"Found {len(pairs)} audio/text pairs in {source_desc}")
 
     # ── Pre-load audio in parallel (biggest I/O speedup) ─────────────
@@ -307,30 +351,16 @@ def main():
         cer_iter = tqdm(cer_iter, total=len(results), desc="CER", ncols=80)
     for i, (r, ref) in enumerate(cer_iter):
         hyp = r.text
-        ref_clean = strip_punctuation(ref) if args.strip_punc else ref
-        hyp_clean = strip_punctuation(hyp) if args.strip_punc else hyp
-        errors, ref_len = compute_cer(ref_clean, hyp_clean)
-        total_errors += errors
-        total_ref_len += ref_len
-        cer_i = errors / ref_len * 100 if ref_len > 0 else 0.0
         name = os.path.basename(audio_paths[i])
-        print(f"  {name}  CER={cer_i:.2f}%  ref={ref}  hyp={hyp}")
+        print(f"  {name}  ref={ref}  hyp={hyp}")
         per_utt.append(
             {
                 "utt_id": utt_ids[i],
                 "audio": audio_paths[i],
                 "ref": ref,
                 "hyp": hyp,
-                "cer": cer_i,
             }
         )
-
-    overall_cer = total_errors / total_ref_len * 100 if total_ref_len > 0 else 0.0
-    print(f"\n===== Results =====")
-    print(f"Total utterances: {len(pairs)}")
-    print(f"Overall CER:      {overall_cer:.2f}%")
-    print(f"Total errors:     {total_errors}")
-    print(f"Total ref chars:  {total_ref_len}")
 
     if args.result_file:
         out_dir = os.path.dirname(args.result_file)
@@ -341,14 +371,27 @@ def main():
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
         print(f"Saved per-utterance results to: {args.result_file}")
 
-        summary_file = os.path.splitext(args.result_file)[0] + "_summary.txt"
-        with open(summary_file, "w", encoding="utf-8") as f:
-            f.write(f"===== Results =====\n")
-            f.write(f"Total utterances: {len(pairs)}\n")
-            f.write(f"Overall CER:      {overall_cer:.2f}%\n")
-            f.write(f"Total errors:     {total_errors}\n")
-            f.write(f"Total ref chars:  {total_ref_len}\n")
-        print(f"Saved summary to: {summary_file}")
+        # Run cal_wer.sh to compute WER using external tool
+        if not args.skip_cal_wer:
+            cal_wer_script = "/cmy/cmy/Qwen3-ASR/cal_wer/cal_wer.sh"
+            if os.path.exists(cal_wer_script):
+                print(f"\nRunning WER computation via {cal_wer_script}...")
+                result_basename = os.path.splitext(os.path.basename(args.result_file))[0]
+                wer_out_dir = f"wer_inputs_{result_basename}"
+
+                try:
+                    subprocess.run(
+                        ["bash", cal_wer_script, args.result_file, wer_out_dir],
+                        check=True,
+                        cwd="/cmy/cmy/Qwen3-ASR/cal_wer"
+                    )
+                    print(f"WER computation completed. Results in cal_wer/{wer_out_dir}/")
+                except subprocess.CalledProcessError as e:
+                    print(f"Warning: WER computation failed with exit code {e.returncode}")
+            else:
+                print(f"Warning: {cal_wer_script} not found, skipping WER computation")
+    else:
+        print("\nNote: --result_file not specified, skipping WER computation")
 
 
 if __name__ == "__main__":

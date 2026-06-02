@@ -1,0 +1,45 @@
+{
+  "generated_at": "2026-05-16T15:30:15.309961",
+  "model": "/cmy/cmy/Qwen3-ASR/qwen3-asr-finetuning-out-bak/checkpoint-326",
+  "latency_summary": {
+    "overall_rtf": 0.04091211413177392,
+    "e2e_latency_p50": 0.09178407769650221,
+    "e2e_latency_p90": 0.16856594178825615,
+    "e2e_latency_p99": 0.2909101427346466
+  },
+  "resource_summary": {
+    "model_size_mb": 11662.5,
+    "gpu_peak_mb": 3977.6,
+    "cpu_peak_mb": 2038.7
+  },
+  "quantization_summary": {
+    "bf16_baseline": {
+      "cer": 25.04,
+      "rtf": 0.0401,
+      "total_infer_sec": 10.39,
+      "total_audio_sec": 259.03,
+      "avg_latency_sec": 0.1039,
+      "gpu_model_mb": 3893.2,
+      "gpu_peak_mb": 4013.6
+    },
+    "int8": {
+      "cer": 25.36,
+      "rtf": 0.1718,
+      "total_infer_sec": 44.49,
+      "total_audio_sec": 259.03,
+      "avg_latency_sec": 0.4449,
+      "gpu_model_mb": 2316.8,
+      "gpu_peak_mb": 2380.8
+    },
+    "int4_nf4": {
+      "cer": 30.27,
+      "rtf": 0.078,
+      "total_infer_sec": 20.2,
+      "total_audio_sec": 259.03,
+      "avg_latency_sec": 0.202,
+      "gpu_model_mb": 1679.4,
+      "gpu_peak_mb": 1583.3
+    }
+  },
+  "recommendation": "see text report"
+}
