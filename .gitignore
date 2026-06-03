@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -18,7 +19,62 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+
+# IDE
 .idea/
 .vscode/
+
+# Virtual envs
 venv/
 env/
+
+# ── Model weights & checkpoints ──────────────────────────────────────────────
+# Pre-trained base model
+Qwen3-ASR-1.7B/
+
+# All fine-tuning checkpoint output dirs
+qwen3-asr-finetuning-out/
+qwen3-asr-finetuning-out-*/
+qwen3-asr-finetuning-all-out-*/
+qwen3-asr-finetune-again-out-*/
+qwen3-asr-lora-out-*/
+finetuning/best_model/
+
+# ── Training & inference outputs ─────────────────────────────────────────────
+outputs/
+finetune_outputs/
+outputs/qwen3-asr-gspo-out/
+
+# ── Raw / derived data (keep only train/test/val.jsonl) ──────────────────────
+# Augmented / merged / filtered derivatives
+data/augmented/
+data/combined_filtered.jsonl
+data/finetune_0305.jsonl
+data/finetune_64758dee.jsonl
+data/finetune_all.jsonl
+data/train_augmented.jsonl
+data/train_augmented_clean.jsonl
+data/train_augmented_clean_filtered.jsonl
+data/train_merged.jsonl
+data/train_with_voxflame.jsonl
+data/train_with_voxflame_converted.jsonl
+
+# ── WER evaluation intermediate files ────────────────────────────────────────
+cal_wer/wer_inputs_*/
+wer_inputs_*/
+
+# ── Customer / raw audio data ─────────────────────────────────────────────────
+customer_audio/
+250305/
+
+# ── Raw data archives ─────────────────────────────────────────────────────────
+raw.tar.gz
+voxflame-oss-by-account/
+voxflame-oss-by-account.zip
+finetuning/new_data_finetune/val.jsonl
+finetuning/new_data_finetune/voxflame_train.jsonl
+
+# ── Misc large / generated files ─────────────────────────────────────────────
+*.tar.gz
+*.zip
+*.log
