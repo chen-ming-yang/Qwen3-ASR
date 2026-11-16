@@ -4,11 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 # Override any path via environment variable, e.g.:
 #   TRAIN_FILE=/path/to/train.jsonl MODEL_PATH=/path/to/model ./run_finetune_continue.sh
 # TRAIN_FILE="${TRAIN_FILE:-data/train_with_voxflame_converted.jsonl}"
-TRAIN_FILE="${TRAIN_FILE:-/cmy/cmy/Qwen3-ASR/data/finetune_64758dee.jsonl}"
+TRAIN_FILE="${TRAIN_FILE:-/cmy/cmy/Qwen3-ASR/data/oss_after_20260524_refresh_0614.jsonl}"
 EVAL_FILE="${EVAL_FILE:-finetuning/new_data_finetune/val.jsonl}"
 MODEL_PATH="${MODEL_PATH:-/cmy/cmy/Qwen3-ASR/qwen3-asr-finetuning-out-20260509/checkpoint-10432}"
 OUTPUT_DIR="${OUTPUT_DIR:-./qwen3-asr-finetuning-out-$(date +%Y%m%d)}"
@@ -21,11 +22,11 @@ python finetuning/qwen3_asr_sft.py \
   --eval_file "${EVAL_FILE}" \
   --output_dir "${OUTPUT_DIR}" \
   --resume 1 \
-  --epochs 20 \
+  --epochs 10 \
   --batch_size 8 \
   --grad_acc 4 \
   --lr 1e-5 \
   --save_steps 200 \
   --max_audio_seconds 60 \
-  --num_workers 0 \
+  --num_workers 2 \
   --persistent_workers 0

@@ -494,8 +494,10 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
         if not os.path.isdir(ckpt_dir):
             ckpt_dir = kwargs.get("checkpoint", ckpt_dir)
 
-        if hasattr(self.model, "save_pretrained"):
-            self.model.save_pretrained(ckpt_dir)
+        # Trainer passes the model via kwargs, not as self.model
+        model = kwargs.get("model")
+        if model is not None and hasattr(model, "save_pretrained"):
+            model.save_pretrained(ckpt_dir)
         copy_required_hf_files_for_qwen_asr(self.base_model_path, ckpt_dir)
         return control
 
@@ -669,17 +671,31 @@ def main():
             # LoRA freezes base weights; without this the embedding output has
             # requires_grad=False and gradient checkpointing breaks with
             # "element 0 of tensors does not require grad".
-            if hasattr(model, "enable_input_require_grads"):
-                model.enable_input_require_grads()
-            else:
+            # Qwen3ASRForConditionalGeneration may not implement get_input_embeddings;
+            # fall back to thinker embeddings or skip the hook.
+            try:
+                if hasattr(model, "enable_input_require_grads"):
+                    model.enable_input_require_grads()
+            except NotImplementedError:
                 def _make_inputs_require_grad(module, inp, out):
-                    out.requires_grad_(True)
+                    if torch.is_tensor(out):
+                        out.requires_grad_(True)
+                    elif isinstance(out, (tuple, list)) and out and torch.is_tensor(out[0]):
+                        out[0].requires_grad_(True)
                 thinker = getattr(model, "thinker", None) or getattr(
-                    getattr(model, "base_model", model), "thinker", None
+                    getattr(model, "base_model", model), "model", None
                 )
-                if thinker is not None:
-                    embed = thinker.get_input_embeddings()
+                thinker = getattr(thinker, "thinker", thinker) if thinker is not None else None
+                embed = None
+                if thinker is not None and hasattr(thinker, "get_input_embeddings"):
+                    try:
+                        embed = thinker.get_input_embeddings()
+                    except NotImplementedError:
+                        embed = None
+                if embed is not None:
                     embed.register_forward_hook(_make_inputs_require_grad)
+                else:
+                    print("[grad_ckpt] warn: could not hook input embeddings; continuing anyway")
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}

@@ -155,7 +155,12 @@ def create_app(model_path: str, port: int, max_new_tokens: int = 512) -> FastAPI
     Load model and configure the app.
     Called by CLI entry point below.
     """
+    import os
+    from pathlib import Path
     global _model
+    # Resolve to absolute path so new huggingface_hub versions don't reject it
+    if os.path.exists(model_path):
+        model_path = str(Path(model_path).resolve())
     logger.info(f"Loading model from {model_path} ...")
     _model = Qwen3ASRModel.from_pretrained(
         pretrained_model_name_or_path=model_path,

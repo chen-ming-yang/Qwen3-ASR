@@ -78,3 +78,6 @@ finetuning/new_data_finetune/voxflame_train.jsonl
 *.tar.gz
 *.zip
 *.log
+
+# 本地解包临时目录
+tmp_extract/

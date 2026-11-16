@@ -4,9 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 MODEL_PATH="${MODEL_PATH:-./Qwen3-ASR-1.7B}"
-TRAIN_FILE="${TRAIN_FILE:-/cmy/cmy/Qwen3-ASR/data/finetune_all.jsonl}"
+TRAIN_FILE="${TRAIN_FILE:-/cmy/cmy/Qwen3-ASR/data/combined_filtered_with_0614.jsonl}"
 EVAL_FILE="${EVAL_FILE:-./data/val.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-./qwen3-asr-finetuning-all-out-$(date +%Y%m%d)}"
 CONDA_ENV="${CONDA_ENV:-qwen3-asr}"

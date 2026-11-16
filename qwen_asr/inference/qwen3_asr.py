@@ -204,8 +204,10 @@ class Qwen3ASRModel:
         """
 
         import os
+        from pathlib import Path
         if isinstance(pretrained_model_name_or_path, str) and os.path.isdir(pretrained_model_name_or_path):
             kwargs.setdefault("local_files_only", True)
+            pretrained_model_name_or_path = Path(pretrained_model_name_or_path).resolve()
 
         model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
 
