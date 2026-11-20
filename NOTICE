@@ -1,0 +1,40 @@
+Qwen3-ASR (this fork) — modifications and fine-tuned checkpoints
+Copyright 2026 chen-ming-yang
+
+This repository is a fork of Qwen3-ASR:
+  https://github.com/QwenLM/Qwen3-ASR
+  Copyright 2026 Alibaba Cloud
+  Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+------------------------------------------------------------------
+Scope of the original upstream work
+------------------------------------------------------------------
+The base code, model architecture, and the Qwen3-ASR-1.7B base
+checkpoint are the work of the Qwen team (Alibaba Cloud) and remain
+under the Apache License, Version 2.0. The LICENSE file in this
+repository is the upstream license and is kept unmodified.
+
+------------------------------------------------------------------
+Scope of the modifications in this fork
+------------------------------------------------------------------
+The following are original work by chen-ming-yang, also released
+under the Apache License, Version 2.0:
+
+  * Fine-tuning recipes and training scripts for WenetSpeech-L,
+    AISHELL and dysarthric-speech data (finetuning/, run/, scripts/)
+  * Data augmentation pipelines (augment_dataset.py and related)
+  * Evaluation harness and CER reporting (eval/, cal_wer/)
+  * The fine-tuned checkpoints published alongside this repository
+    (config.json, model.safetensors, tokenizer files under the
+    released ModelScope / HuggingFace repositories)
+
+------------------------------------------------------------------
+Third-party components
+------------------------------------------------------------------
+  * HuggingFace Transformers — Apache License 2.0
+  * PyTorch — BSD-style license
+  * WenetSpeech — CC-BY-4.0 (audio not redistributed here)
+  * FireRedASR2 / Qwen3-ASR model outputs used for consensus
+    filtering are metadata only
+
+All third-party components remain under their original licenses.
